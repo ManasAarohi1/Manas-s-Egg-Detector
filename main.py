@@ -15,7 +15,7 @@ import webbrowser
 import gc
 import ctypes
 from ctypes import wintypes
-from mousekey import MouseKey
+import MouseKey
 import keyboard
 import sys
 from thefuzz import fuzz

@@ -1,4 +1,4 @@
-Follow the tutorial below: https://youtu.be/dlsJxg9s9ts
+Follow the tutorial below: https://youtu.be/ksCZAtqD99E
 
 The paths only work with VIP, Please do not report issues with pathing without VIP.
 

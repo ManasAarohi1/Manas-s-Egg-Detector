@@ -1,3 +1,8 @@
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
@@ -10,69 +15,14 @@ import re
 import os
 import json
 import webbrowser
-import ctypes
 from ctypes import wintypes
 from mousekey import MouseKey
-import keyboard
 import sys
-from thefuzz import fuzz
 import difflib
 import mss
-from PIL import Image, ImageOps
-import multiprocessing
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-
-POOL_ENGINE = None
-
-def _init_pool_reader():
-    global POOL_ENGINE
-    if POOL_ENGINE is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            try:
-                POOL_ENGINE = RapidOCR(
-                    engine_kwargs={"providers": ["CUDAExecutionProvider", "CPUExecutionProvider"]}
-                )
-            except TypeError:
-                POOL_ENGINE = RapidOCR()
-        except Exception as e:
-            print(f"Failed to load OCR: {e}")
-
-def _pool_ocr_task(img_bgr):
-    global POOL_ENGINE
-    if POOL_ENGINE is None:
-        _init_pool_reader()
-
-    if POOL_ENGINE is None:
-        return {"result": None, "error": "RapidOCR Engine failed to initialize."}
-
-    try:
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        resized = cv2.resize(gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_LANCZOS4)
-        inverted = cv2.bitwise_not(resized)
-        
-        final_bgr = cv2.cvtColor(inverted, cv2.COLOR_GRAY2BGR)
-
-        ocr_result, _ = POOL_ENGINE(final_bgr)
-        return {"result": ocr_result, "error": None}
-    except Exception as e:
-        return {"result": None, "error": str(e)}
-
-def compute_frame_hash(image: Image.Image, hash_size: int = 16) -> int:
-    gray = image if image.mode == "L" else image.convert("L")
-    small = gray.resize((hash_size, hash_size), Image.BILINEAR)
-    arr = np.asarray(small, dtype=np.float32)
-    avg = float(arr.mean()) if arr.size else 0.0
-    bits = (arr > avg).astype(np.uint8).reshape(-1)
-    packed = np.packbits(bits)
-    return int.from_bytes(packed.tobytes(), byteorder="big", signed=False)
-
-def frame_hash_diff_percent(hash_a: int, hash_b: int, hash_size: int = 16) -> float:
-    bits = int(hash_size) * int(hash_size)
-    dist = (int(hash_a) ^ int(hash_b)).bit_count()
-    return (float(dist) / float(bits)) * 100.0
+from PIL import Image
+import multiprocessing 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 def resource_path(relative_path):
     try:
@@ -80,6 +30,56 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+POOL_ENGINE = None
+_OCR_INIT_ERROR = None
+
+def _init_pool_reader():
+    global POOL_ENGINE, _OCR_INIT_ERROR
+    if POOL_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            try:
+                POOL_ENGINE = RapidOCR(
+                    engine_kwargs={
+                        "intra_op_num_threads": 1,
+                        "inter_op_num_threads": 1,
+                        "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                    }
+                )
+            except Exception:
+                POOL_ENGINE = RapidOCR(
+                    engine_kwargs={
+                        "intra_op_num_threads": 1,
+                        "inter_op_num_threads": 1,
+                        "providers": ["CPUExecutionProvider"]
+                    }
+                )
+        except Exception as e:
+            _OCR_INIT_ERROR = str(e)
+
+def _pool_ocr_task(img_bgr):
+    try:
+        global POOL_ENGINE, _OCR_INIT_ERROR
+        
+        if globals().get('POOL_ENGINE') is None:
+            _init_pool_reader()
+
+        if POOL_ENGINE is None:
+            return {"result": None, "error": f"Init Failed: {_OCR_INIT_ERROR}"}
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        
+        resized = cv2.resize(gray, (0, 0), fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+        gray_norm = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
+        inverted = cv2.bitwise_not(gray_norm)
+        
+        final_bgr = cv2.cvtColor(inverted, cv2.COLOR_GRAY2BGR)
+
+        ocr_result, _ = POOL_ENGINE(final_bgr)
+        return {"result": ocr_result, "error": None}
+    except Exception as e:
+        return {"result": None, "error": str(e)}
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 winmm = ctypes.WinDLL('winmm')
@@ -113,31 +113,31 @@ def send_scancode(scancode, is_pressed):
               ki=KEYBDINPUT(wVk=0, wScan=scancode, dwFlags=flags, time=0, dwExtraInfo=None))
     user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
 
-CURRENT_VERSION = "v1.1.0"  
+CURRENT_VERSION = "v1.2.1"  
 GITHUB_REPO = "ManasAarohi1/Manas-s-Egg-Detector"
 
 COLOR_RANGES = {
-    "purple": [(np.array([125, 50, 50]), np.array([155, 255, 255]))],
-    "blue": [(np.array([100, 50, 50]), np.array([135, 255, 255]))],
-    "green": [(np.array([40, 50, 50]), np.array([85, 255, 255]))],
-    "cyan": [(np.array([85, 50, 50]), np.array([105, 255, 255]))],
-    "pink": [(np.array([145, 50, 50]), np.array([170, 255, 255]))],
-    "orange": [(np.array([10, 80, 80]), np.array([25, 255, 255]))], 
+    "dreamer_purple": [(np.array([130, 100, 100]), np.array([140, 255, 255]))],
+    "protocol_violet": [(np.array([137, 100, 100]), np.array([147, 255, 255]))], 
+    "spaaaaace_indigo": [(np.array([115, 100, 80]), np.array([130, 255, 255]))],
+    "hunt_cyan": [(np.array([85, 100, 100]), np.array([95, 255, 255]))],
+    "cannon_yellowgreen": [(np.array([35, 80, 80]), np.array([65, 255, 255]))],
+    "plant_magenta": [(np.array([160, 100, 100]), np.array([170, 255, 255]))],
+    "holy_orange": [(np.array([10, 100, 100]), np.array([20, 255, 255]))],
     "special_colors": [
-        (np.array([0, 100, 100]), np.array([10, 255, 255])),  
-        (np.array([160, 100, 100]), np.array([180, 255, 255])),
-        (np.array([40, 50, 50]), np.array([90, 255, 255]))
+        (np.array([3, 70, 70]), np.array([25, 255, 255])),
+        (np.array([45, 70, 70]), np.array([85, 255, 255]))
     ]
 }
 
 EGG_KEYWORDS = {
-    "dreaming": {"name": "Dreamer egg (Sky Festival)", "color": "purple"},
-    "protocol": {"name": "Egg v2.0 (Y.O.L.K.E.G.G)", "color": "blue"},
-    "cannon": {"name": "The Egg of the Sky (Eggis)", "color": "green"},
-    "hunt": {"name": "Forest Egg (Eostre)", "color": "cyan"},
-    "plant": {"name": "Blooming Egg (Eggore)", "color": "pink"},
-    "holy": {"name": "Angelic Egg (REVIVE)", "color": "orange"},
-    "spaaaaace": {"name": "Andromeda egg (Eggsistance)", "color": "blue"},
+    "dreaming": {"name": "Dreamer egg (Sky Festival)", "color": "dreamer_purple"},
+    "protocol": {"name": "Egg v2.0 (Y.O.L.K.E.G.G)", "color": "protocol_violet"}, 
+    "cannon": {"name": "The Egg of the Sky (Eggis)", "color": "cannon_yellowgreen"},
+    "hunt": {"name": "Forest Egg (Eostre)", "color": "hunt_cyan"},
+    "plant": {"name": "Blooming Egg (Eggore)", "color": "plant_magenta"},
+    "holy": {"name": "Angelic Egg (REVIVE)", "color": "holy_orange"},
+    "spaaaaace": {"name": "Andromeda egg (Eggsistance)", "color": "spaaaaace_indigo"},
     "special": {"name": "SPECIAL_CHECK", "color": "special_colors"}
 }
 
@@ -165,10 +165,10 @@ def determine_special_egg_type(image_bgr, bbox):
     xs = [p[0] for p in bbox]
     ys = [p[1] for p in bbox]
     
-    x_min = max(0, int(min(xs) / 2.0))
-    y_min = max(0, int(min(ys) / 2.0))
-    x_max = int(max(xs) / 2.0)
-    y_max = int(max(ys) / 2.0)
+    x_min = max(0, int(min(xs) / 1.5))
+    y_min = max(0, int(min(ys) / 1.5))
+    x_max = int(max(xs) / 1.5)
+    y_max = int(max(ys) / 1.5)
     
     crop = image_bgr[y_min:y_max, x_min:x_max]
     
@@ -177,25 +177,20 @@ def determine_special_egg_type(image_bgr, bbox):
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     
-    lower_red1 = np.array([0, 100, 100])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 100, 100])
-    upper_red2 = np.array([180, 255, 255])
+    lower_orange = np.array([3, 70, 70])
+    upper_orange = np.array([25, 255, 255])
+    mask_orange = cv2.inRange(hsv, lower_orange, upper_orange)
     
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-    
-    lower_green = np.array([40, 50, 50])
-    upper_green = np.array([90, 255, 255])
+    lower_green = np.array([45, 70, 70])
+    upper_green = np.array([85, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     
-    red_pixels = cv2.countNonZero(mask_red)
+    orange_pixels = cv2.countNonZero(mask_orange)
     green_pixels = cv2.countNonZero(mask_green)
 
-    if red_pixels > green_pixels and red_pixels > 5:
+    if orange_pixels > green_pixels and orange_pixels > 15:
         return "Royal egg (Emperor)"
-    elif green_pixels > red_pixels and green_pixels > 5:
+    elif green_pixels > orange_pixels and green_pixels > 15:
         return "Hatch Egg (Hatchwarden)"
     else:
         return "Unknown Special Egg"
@@ -206,10 +201,11 @@ def check_text_color(image_bgr, bbox, expected_color_name):
     
     xs = [p[0] for p in bbox]
     ys = [p[1] for p in bbox]
-    x_min = max(0, int(min(xs) / 2.0))
-    y_min = max(0, int(min(ys) / 2.0))
-    x_max = int(max(xs) / 2.0)
-    y_max = int(max(ys) / 2.0)
+    
+    x_min = max(0, int(min(xs) / 1.5) - 4)
+    y_min = max(0, int(min(ys) / 1.5) - 4)
+    x_max = int(max(xs) / 1.5) + 4
+    y_max = int(max(ys) / 1.5) + 4
     
     crop = image_bgr[y_min:y_max, x_min:x_max]
     
@@ -223,13 +219,13 @@ def check_text_color(image_bgr, bbox, expected_color_name):
         mask = cv2.inRange(hsv, lower, upper)
         total_matched_pixels += cv2.countNonZero(mask)
         
-    return total_matched_pixels > 5
+    return total_matched_pixels > 2
 
 class EggMonitorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Manas's Egg Detector - {CURRENT_VERSION}")
-        self.root.geometry("650x980")
+        self.root.geometry("650x1100")
         self.root.configure(bg="#1e1e1e")
 
         self.style = ttk.Style()
@@ -254,30 +250,46 @@ class EggMonitorGUI:
         self.collection_pos = None
         self.collection_close_pos = None
         self.chat_toggle_pos = None
+        self.exit_failsafe_positions = [] 
         
         self.is_running = False
         self.egg_cooldowns = {}
         self.is_playing_path = False
         self.path_lock = threading.Lock()
         self.last_periodic_time = time.time()
+        self.last_periodic_ss_time = time.time()
+        self.global_pause_until = 0
         
         self.current_webhook_url = ""
         self.current_user_id = ""
         self.current_run_on_detect = False
         self.current_run_periodic = False
+        self.current_run_continuous = False
+        self.current_run_periodic_ss = False
 
         self.ocr_pool = None
         self.last_frame_hash = None
         self.current_future = None
-        self.exit_collection_pos = None
+        
         self.setup_ui()
         self.load_config()
         
-        keyboard.add_hotkey('f1', self.start_scanner_hotkey)
-        keyboard.add_hotkey('f2', self.stop_scanner_hotkey)
-        
+        threading.Thread(target=self.hotkey_listener, daemon=True).start()
         threading.Thread(target=self.check_for_updates, daemon=True).start()
         threading.Thread(target=self.periodic_path_loop, daemon=True).start()
+        threading.Thread(target=self.periodic_screenshot_loop, daemon=True).start()
+
+    def hotkey_listener(self):
+        VK_F1 = 0x70
+        VK_F2 = 0x71
+        while True:
+            if user32.GetAsyncKeyState(VK_F1) & 0x8000:
+                self.start_scanner_hotkey()
+                time.sleep(0.3) 
+            if user32.GetAsyncKeyState(VK_F2) & 0x8000:
+                self.stop_scanner_hotkey()
+                time.sleep(0.3)
+            time.sleep(0.05)
 
     def check_for_updates(self):
         self.log_message("Checking GitHub for updates...")
@@ -319,6 +331,17 @@ class EggMonitorGUI:
         self.userid_entry = ttk.Entry(discord_frame, width=60)
         self.userid_entry.pack(fill=tk.X)
 
+        ss_frame = ttk.Frame(discord_frame)
+        ss_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        self.run_periodic_ss_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ss_frame, text="Periodic screenshot every", variable=self.run_periodic_ss_var).pack(side=tk.LEFT)
+        
+        self.periodic_ss_minutes_entry = ttk.Entry(ss_frame, width=6, justify="center")
+        self.periodic_ss_minutes_entry.insert(0, "15")
+        self.periodic_ss_minutes_entry.pack(side=tk.LEFT, padx=10)
+        ttk.Label(ss_frame, text="minutes").pack(side=tk.LEFT)
+
         path_frame = ttk.LabelFrame(main_container, text=" Pathing Automation ", padding="15 15 15 15")
         path_frame.pack(fill=tk.X, pady=(0, 15))
         
@@ -335,6 +358,9 @@ class EggMonitorGUI:
         self.periodic_minutes_entry.insert(0, "20")
         self.periodic_minutes_entry.pack(side=tk.LEFT, padx=10)
         ttk.Label(periodic_frame, text="minutes").pack(side=tk.LEFT)
+
+        self.run_continuous_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(path_frame, text="Loop paths continuously (Forever Loop)", variable=self.run_continuous_var).pack(anchor=tk.W, pady=(10, 0))
 
         calib_frame = ttk.LabelFrame(main_container, text=" Calibration ", padding="15 15 15 15")
         calib_frame.pack(fill=tk.X, pady=(0, 15))
@@ -388,9 +414,16 @@ class EggMonitorGUI:
                     self.run_on_detect_var.set(data["run_on_detect"])
                 if "run_periodic" in data:
                     self.run_periodic_var.set(data["run_periodic"])
+                if "run_continuous" in data:
+                    self.run_continuous_var.set(data["run_continuous"])
                 if "periodic_minutes" in data:
                     self.periodic_minutes_entry.delete(0, tk.END)
                     self.periodic_minutes_entry.insert(0, str(data["periodic_minutes"]))
+                if "run_periodic_ss" in data:
+                    self.run_periodic_ss_var.set(data["run_periodic_ss"])
+                if "periodic_ss_minutes" in data:
+                    self.periodic_ss_minutes_entry.delete(0, tk.END)
+                    self.periodic_ss_minutes_entry.insert(0, str(data["periodic_ss_minutes"]))
                 if "chat_region" in data and data["chat_region"]:
                     self.chat_region = tuple(data["chat_region"])
                 if "collection_pos" in data and data["collection_pos"]:
@@ -399,8 +432,12 @@ class EggMonitorGUI:
                     self.collection_close_pos = tuple(data["collection_close_pos"])
                 if "chat_toggle_pos" in data and data["chat_toggle_pos"]:
                     self.chat_toggle_pos = tuple(data["chat_toggle_pos"])
-                if "exit_collection_pos" in data and data["exit_collection_pos"]:
-                    self.exit_collection_pos = tuple(data["exit_collection_pos"])
+                
+                if "exit_failsafe_positions" in data:
+                    self.exit_failsafe_positions = [tuple(p) for p in data["exit_failsafe_positions"]]
+                elif "exit_collection_pos" in data and data["exit_collection_pos"]:
+                    self.exit_failsafe_positions = [tuple(data["exit_collection_pos"])]
+                    
             except Exception as e:
                 self.log_message(f"Failed to load config: {e}")
 
@@ -412,6 +449,11 @@ class EggMonitorGUI:
         except ValueError:
             periodic_mins = 25.0
             
+        try:
+            periodic_ss_mins = float(self.periodic_ss_minutes_entry.get().strip())
+        except ValueError:
+            periodic_ss_mins = 15.0
+            
         config_data = {
             "webhook_url": self.webhook_entry.get().strip(),
             "user_id": self.userid_entry.get().strip(),
@@ -421,8 +463,11 @@ class EggMonitorGUI:
             "chat_toggle_pos": self.chat_toggle_pos,
             "run_on_detect": self.run_on_detect_var.get(),
             "run_periodic": self.run_periodic_var.get(),
+            "run_continuous": self.run_continuous_var.get(),
             "periodic_minutes": periodic_mins,
-            "exit_collection_pos": self.exit_collection_pos
+            "run_periodic_ss": self.run_periodic_ss_var.get(),
+            "periodic_ss_minutes": periodic_ss_mins,
+            "exit_failsafe_positions": self.exit_failsafe_positions
         }
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -437,9 +482,10 @@ class EggMonitorGUI:
 
         self.calib_menu = tk.Toplevel(self.root)
         self.calib_menu.title("Calibration Menu")
-        self.calib_menu.geometry("400x600")
+        self.calib_menu.geometry("400x700")
         self.calib_menu.configure(bg="#1e1e1e")
-        self.calib_menu.resizable(False, False)
+        
+        self.calib_menu.transient(self.root)
 
         ttk.Label(self.calib_menu, text="Current Calibration Status:", font=("Segoe UI", 11, "bold")).pack(pady=(15, 5))
 
@@ -462,8 +508,20 @@ class EggMonitorGUI:
         ttk.Button(self.calib_menu, text="Calibrate Chat Toggle Icon", command=self.start_chat_toggle_calibration).pack(fill=tk.X, pady=5, padx=20)
         ttk.Button(self.calib_menu, text="Calibrate Collection OPEN Btn", command=self.start_collection_calibration).pack(fill=tk.X, pady=5, padx=20)
         ttk.Button(self.calib_menu, text="Calibrate Collection CLOSE Btn", command=self.start_collection_close_calibration).pack(fill=tk.X, pady=5, padx=20)
-        ttk.Button(self.calib_menu, text="Calibrate Exit Questboard Btn", command=self.start_exit_failsafe_calibration).pack(fill=tk.X, pady=5, padx=20)
+        
+        ttk.Label(self.calib_menu, text="Menu Failsafe Sequence:", font=("Segoe UI", 10, "bold")).pack(pady=(15, 5))
+        ttk.Button(self.calib_menu, text="Calibrate Exit Failsafe(s)", command=self.start_exit_failsafe_calibration).pack(fill=tk.X, pady=5, padx=20)
+        
+        clear_btn_style = ttk.Style()
+        clear_btn_style.configure("Clear.TButton", background="#ff4757", foreground="white")
+        ttk.Button(self.calib_menu, text="Clear All Failsafe Locations", style="Clear.TButton", command=self.clear_failsafes).pack(fill=tk.X, pady=5, padx=20)
     
+    def clear_failsafes(self):
+        self.exit_failsafe_positions = []
+        self.save_config()
+        self.update_calibration_statuses()
+        self.log_message("Cleared all failsafe locations.")
+        
     def update_calibration_statuses(self):
         if not hasattr(self, 'calib_menu') or not self.calib_menu.winfo_exists():
             return
@@ -474,7 +532,9 @@ class EggMonitorGUI:
         self.status_chat_tog.config(text=f"Chat Toggle: {format_status(self.chat_toggle_pos)}", foreground=get_color(self.chat_toggle_pos))
         self.status_coll_open.config(text=f"Collection Open: {format_status(self.collection_pos)}", foreground=get_color(self.collection_pos))
         self.status_coll_close.config(text=f"Collection Close: {format_status(self.collection_close_pos)}", foreground=get_color(self.collection_close_pos))
-        self.status_exit_failsafe.config(text=f"Exit Questboard: {format_status(self.exit_collection_pos)}", foreground=get_color(self.exit_collection_pos))
+        
+        failsafe_status = f"✅ Calibrated ({len(self.exit_failsafe_positions)} spots)" if self.exit_failsafe_positions else "❌ Not Set"
+        self.status_exit_failsafe.config(text=f"Exit Failsafes: {failsafe_status}", foreground=get_color(self.exit_failsafe_positions))
         
     def start_calibration(self):
         self.calib_window = tk.Toplevel(self.root)
@@ -496,9 +556,52 @@ class EggMonitorGUI:
         self.calib_window.attributes('-alpha', 0.4)
         self.calib_window.attributes('-fullscreen', True)
         self.calib_window.configure(cursor="cross")
-        self.calib_window.bind("<ButtonPress-1>", lambda e: self._handle_click_calib(e, 'exit_collection_pos'))
+        self.calib_window.bind("<ButtonPress-1>", self._on_failsafe_click)
         self.calib_window.bind("<Escape>", lambda e: self.calib_window.destroy())
         
+    def _on_failsafe_click(self, event):
+        self.calib_window.unbind("<ButtonPress-1>")
+        temp_x, temp_y = event.x_root, event.y_root
+
+        popup = tk.Toplevel(self.calib_window)
+        popup.title("Failsafe Point")
+        popup.geometry("450x130")
+        popup.configure(bg="#1e1e1e")
+        popup.resizable(True, True)
+        popup.attributes('-topmost', True)
+        popup.grab_set()
+
+        safe_x = min(temp_x + 20, self.calib_window.winfo_width() - 450)
+        safe_y = min(temp_y + 20, self.calib_window.winfo_height() - 130)
+        popup.geometry(f"+{safe_x}+{safe_y}")
+
+        ttk.Label(popup, text=f"Recorded failsafe click at ({temp_x}, {temp_y})", font=("Segoe UI", 10)).pack(pady=(10, 5))
+
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        def on_redo():
+            popup.destroy()
+            self.calib_window.bind("<ButtonPress-1>", self._on_failsafe_click)
+
+        def on_add_new():
+            self.exit_failsafe_positions.append((temp_x, temp_y))
+            popup.destroy()
+            self.calib_window.bind("<ButtonPress-1>", self._on_failsafe_click)
+
+        def on_finished():
+            self.exit_failsafe_positions.append((temp_x, temp_y))
+            popup.destroy()
+            self.save_config()
+            self.update_calibration_statuses()
+            self.calib_window.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", on_redo)
+
+        ttk.Button(btn_frame, text="Redo", command=on_redo).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(btn_frame, text="Add New", command=on_add_new).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(btn_frame, text="Finished", command=on_finished).pack(side=tk.LEFT, expand=True, padx=2)
+
     def on_press(self, event):
         self.start_x = event.x
         self.start_y = event.y
@@ -587,14 +690,23 @@ class EggMonitorGUI:
         time.sleep(delay)
 
     def exit_collection_failsafe(self):
-        if self.exit_collection_pos:
-            self.click_mouse(*self.exit_collection_pos, delay=0.2)
+        if not self.exit_failsafe_positions:
+            return
+        for pos in self.exit_failsafe_positions:
+            self.click_mouse(*pos, delay=0.3)
+        time.sleep(1.0) 
         
     def reset_character(self):
-        for key in ['esc', 'r', 'enter']:
-            code = self.get_scan_code(key)
-            send_scancode(code, True); time.sleep(0.05); send_scancode(code, False)
-            time.sleep(0.3)
+        code_esc = self.get_scan_code('esc')
+        send_scancode(code_esc, True); time.sleep(0.05); send_scancode(code_esc, False)
+        time.sleep(0.8) 
+
+        code_r = self.get_scan_code('r')
+        send_scancode(code_r, True); time.sleep(0.05); send_scancode(code_r, False)
+        time.sleep(0.5) 
+
+        code_enter = self.get_scan_code('enter')
+        send_scancode(code_enter, True); time.sleep(0.05); send_scancode(code_enter, False)
         time.sleep(1.5)
         
     def snap_camera_up(self):
@@ -614,7 +726,11 @@ class EggMonitorGUI:
             
             ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0) 
             time.sleep(0.05)
-            ctypes.windll.user32.mouse_event(0x0001, 0, 1500, 0, 0) 
+            
+            for _ in range(5):
+                ctypes.windll.user32.mouse_event(0x0001, 0, 300, 0, 0)
+                time.sleep(0.02)
+                
             time.sleep(0.05)
             ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0) 
             time.sleep(0.2)
@@ -623,11 +739,10 @@ class EggMonitorGUI:
             self.log_message(f"Camera snap error: {e}")
         
     def execute_camera_alignment(self):
-        
         send_scancode(0x35, True); time.sleep(0.05); send_scancode(0x35, False)
-        time.sleep(0.4) 
+        time.sleep(0.6) 
         send_scancode(0x1C, True); time.sleep(0.05); send_scancode(0x1C, False)
-        time.sleep(0.6)
+        time.sleep(0.8)
 
         if self.chat_toggle_pos: 
             self.click_mouse(*self.chat_toggle_pos, delay=1.0)
@@ -644,13 +759,12 @@ class EggMonitorGUI:
             self.click_mouse(*self.chat_toggle_pos, delay=1.0)
 
         send_scancode(0x35, True); time.sleep(0.05); send_scancode(0x35, False)
-        time.sleep(0.3) 
+        time.sleep(0.5) 
         send_scancode(0x1C, True); time.sleep(0.05); send_scancode(0x1C, False)
-        time.sleep(0.3)
+        time.sleep(0.5)
         
         self.snap_camera_up()
     
-
     def play_path_sequence(self):
         if not self.path_lock.acquire(blocking=False):
             return  
@@ -664,47 +778,59 @@ class EggMonitorGUI:
             winmm.timeBeginPeriod(1)
             
             try:
-                for path_file in path_files:
-                    if not self.is_running: break 
-                    actual_path = resource_path(path_file)
-                    if not os.path.exists(actual_path): continue
-                    
-                    try:
-                        with open(actual_path, 'r') as f: data = json.load(f)
-                        if not data: continue
+                while self.is_running:
+                    for path_file in path_files:
+                        if not self.is_running: break 
+                        actual_path = resource_path(path_file)
+                        if not os.path.exists(actual_path): continue
                         
-                        self.exit_collection_failsafe()
-                        self.reset_character()
-                        self.execute_camera_alignment()
-                        
-                        self.reset_all_keys()
-                        time.sleep(0.3)
-
-                        playback_start_time = time.perf_counter()
-                        
-                        for event in data:
-                            if not self.is_running: break 
+                        try:
+                            with open(actual_path, 'r') as f: data = json.load(f)
+                            if not data: continue
                             
-                            if event.get('type') == 'k':
-                                target_time = event['t']
-                                key_str = event['k']
-                                is_pressed = event['p']
+                            self.exit_collection_failsafe()
+                            
+                            if self.is_running:
+                                try:
+                                    with mss.mss() as sct:
+                                        self.process_screen(sct)
+                                except Exception as e:
+                                    self.log_message(f"Path-end scan error: {e}")
+                            
+                            self.reset_character()
+                            self.execute_camera_alignment()
+                            
+                            self.reset_all_keys()
+                            time.sleep(0.5)
+
+                            playback_start_time = time.perf_counter()
+                            
+                            for event in data:
+                                if not self.is_running: break 
                                 
-                                time_to_wait = target_time - (time.perf_counter() - playback_start_time)
-                                if time_to_wait > 0.005: 
-                                    time.sleep(time_to_wait - 0.003)
+                                if event.get('type') == 'k':
+                                    target_time = event['t']
+                                    key_str = event['k']
+                                    is_pressed = event['p']
                                     
-                                while time.perf_counter() - playback_start_time < target_time: 
-                                    pass 
-                                
-                                scancode = self.get_scan_code(key_str)
-                                if scancode: send_scancode(scancode, is_pressed)
-                                
-                    except Exception as e:
-                        self.log_message(f"Playback Error: {e}")
-                    finally:
-                        self.reset_all_keys()
-                        time.sleep(1.0)
+                                    time_to_wait = target_time - (time.perf_counter() - playback_start_time)
+                                    if time_to_wait > 0.005: 
+                                        time.sleep(time_to_wait - 0.003)
+                                        
+                                    while time.perf_counter() - playback_start_time < target_time: 
+                                        time.sleep(0.0001) 
+                                    
+                                    scancode = self.get_scan_code(key_str)
+                                    if scancode: send_scancode(scancode, is_pressed)
+                                    
+                        except Exception as e:
+                            self.log_message(f"Playback Error: {e}")
+                        finally:
+                            self.reset_all_keys()
+                            time.sleep(0.3)
+                            
+                    if not self.is_running or not self.current_run_continuous:
+                        break
             finally:
                 winmm.timeEndPeriod(1)
         finally:
@@ -715,13 +841,48 @@ class EggMonitorGUI:
     def periodic_path_loop(self):
         while True:
             time.sleep(1)
-            if self.is_running and self.current_run_periodic and not self.is_playing_path:
+            if self.is_running and self.current_run_periodic and not self.is_playing_path and not self.current_run_continuous:
                 try:
                     mins = float(self.periodic_minutes_entry.get().strip())
                     if time.time() - self.last_periodic_time > (mins * 60):
                         self.play_path_sequence()
                 except ValueError: pass
                 except Exception: pass
+
+    def periodic_screenshot_loop(self):
+        while True:
+            time.sleep(1)
+            if self.is_running and self.current_run_periodic_ss:
+                try:
+                    mins = float(self.periodic_ss_minutes_entry.get().strip())
+                    if time.time() - getattr(self, 'last_periodic_ss_time', time.time()) > (mins * 60):
+                        self.take_periodic_screenshot()
+                        self.last_periodic_ss_time = time.time()
+                except ValueError:
+                    pass
+                except Exception:
+                    pass
+
+    def take_periodic_screenshot(self):
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                
+                w = int(monitor["width"] * 0.10)
+                h = int(monitor["height"] * 0.20)
+                
+                top = monitor["top"] + monitor["height"] - h
+                left = monitor["left"]
+                
+                capture_region = {"top": top, "left": left, "width": w, "height": h}
+                screenshot = sct.grab(capture_region)
+            
+            img_np = np.array(screenshot)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+            
+            self.send_discord_webhook(egg_name=None, image_bgr=img_bgr, is_periodic=True)
+        except Exception as e:
+            self.log_message(f"Periodic screenshot error: {e}")
 
     def start_scanner_hotkey(self):
         if not self.is_running: self.root.after(0, self.start_scanner)
@@ -738,23 +899,26 @@ class EggMonitorGUI:
         self.is_running = True
         self.last_frame_hash = None 
         self.last_periodic_time = time.time()
+        self.last_periodic_ss_time = time.time()
         
         self.current_webhook_url = self.webhook_entry.get().strip()
         self.current_user_id = self.userid_entry.get().strip()
         self.current_run_on_detect = self.run_on_detect_var.get()
         self.current_run_periodic = self.run_periodic_var.get()
+        self.current_run_continuous = self.run_continuous_var.get()
+        self.current_run_periodic_ss = self.run_periodic_ss_var.get()
         
         if not self.current_webhook_url:
             self.log_message("Warning: No Webhook provided. Discord alerts disabled.")
 
         self.ocr_pool = ThreadPoolExecutor(max_workers=1)
-
+        
         self.btn_start.config(state=tk.DISABLED)
         self.btn_open_calib.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.send_status_webhook("started")
                 
-        if self.current_run_periodic:
+        if self.current_run_periodic or self.current_run_continuous:
             threading.Thread(target=self.play_path_sequence, daemon=True).start()
         
         threading.Thread(target=self.scan_loop, daemon=True).start()
@@ -762,7 +926,7 @@ class EggMonitorGUI:
     def stop_scanner(self):
         self.is_running = False
         if self.ocr_pool:
-            self.ocr_pool.shutdown(wait=False, cancel_futures=True)
+            self.ocr_pool.shutdown(wait=False)
             self.ocr_pool = None
             
         self.current_future = None
@@ -773,52 +937,57 @@ class EggMonitorGUI:
         self.send_status_webhook("stopped")
         
     def scan_loop(self):
-        while self.is_running:
-            start_time = time.time()
+        with mss.mss() as sct:
+            while self.is_running:
+                start_time = time.time()
+                
+                if not self.is_playing_path:
+                    self.process_screen(sct)
+                    
+                elapsed = time.time() - start_time
+                sleep_time = max(0, 7.5 - elapsed)
+                time.sleep(sleep_time)
+                
+    def process_screen(self, sct):
+        try:
+            if time.time() < self.global_pause_until:
+                return
+
+            monitor = {
+                "top": self.chat_region[1], 
+                "left": self.chat_region[0], 
+                "width": self.chat_region[2], 
+                "height": self.chat_region[3]
+            }
+            screenshot = sct.grab(monitor)
+                
+            img_np = np.array(screenshot)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
             
-            if not self.is_playing_path:
-                self.process_screen()
-                
-            elapsed = time.time() - start_time
-            sleep_time = max(0, 0.5 - elapsed)
-            time.sleep(sleep_time)
-
-    def process_screen(self):
-            try:
-                with mss.mss() as sct:
-                    monitor = {
-                        "top": self.chat_region[1], 
-                        "left": self.chat_region[0], 
-                        "width": self.chat_region[2], 
-                        "height": self.chat_region[3]
-                    }
-                    screenshot = sct.grab(monitor)
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            
+            for color_name, ranges in COLOR_RANGES.items():
+                for lower, upper in ranges:
+                    mask = cv2.inRange(hsv, lower, upper)
+                    combined_mask = cv2.bitwise_or(combined_mask, mask)
                     
-                img_np = np.array(screenshot)
-                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
-                
-                gray_for_hash = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-                pil_img_for_hash = Image.fromarray(gray_for_hash)
-                
-                current_hash = compute_frame_hash(pil_img_for_hash)
-                if self.last_frame_hash is not None:
-                    diff_pct = frame_hash_diff_percent(self.last_frame_hash, current_hash)
-                    if diff_pct < 2.0:
-                        return 
-                
-                self.last_frame_hash = current_hash
+            pixel_count = cv2.countNonZero(combined_mask)
+            
+            if pixel_count < 10:
+                return
 
-                if self.current_future and not self.current_future.done():
-                    return
-                    
-                if not self.is_running or self.ocr_pool is None:
-                    return
-                    
-                self.current_future = self.ocr_pool.submit(_pool_ocr_task, img_bgr)
-                threading.Thread(target=self.handle_ocr_result, args=(self.current_future, img_bgr), daemon=True).start()
+            if self.current_future and not self.current_future.done():
+                return
+                
+            if not self.is_running or self.ocr_pool is None:
+                return
+                
+            self.current_future = self.ocr_pool.submit(_pool_ocr_task, img_bgr)
+            threading.Thread(target=self.handle_ocr_result, args=(self.current_future, img_bgr), daemon=True).start()
 
-            except Exception as e:
-                self.log_message(f"Screen capture error: {e}")
+        except Exception as e:
+            self.log_message(f"Screen capture error: {e}")
 
     def handle_ocr_result(self, future, img_bgr):
         try:
@@ -828,35 +997,51 @@ class EggMonitorGUI:
                 return
                 
             results = result_dict.get("result")
-            if not results: return
+            if not results: 
+                return
 
             full_chat_text = " ".join([res[1].lower() for res in results])
-            
+                        
             is_spawn_msg = False
-            for trigger in ["egg spawned", "spawned]:"]:
+            for trigger in ["egg spawned", "spawned]:", "has spawned"]:
                 if is_fuzzy_match(trigger, full_chat_text, threshold=0.80):
                     is_spawn_msg = True
                     break
 
-            if not is_spawn_msg: return 
+            if not is_spawn_msg: 
+                return 
 
+            full_clean_text = clean_text(full_chat_text)
+            
             detected_egg = None
-            for (bbox, text, prob) in results:
-                cleaned_line = clean_text(text)
-                for keyword, egg_data in EGG_KEYWORDS.items():
-                    if is_fuzzy_match(clean_text(keyword), cleaned_line, threshold=0.85):
+            for keyword, egg_data in EGG_KEYWORDS.items():
+                if is_fuzzy_match(clean_text(keyword), full_clean_text, threshold=0.85):
+                    
+                    expected_color = egg_data["color"]
+                    color_confirmed = False
+
+                    for (bbox, text, prob) in results:
+                        clean_word = clean_text(text)
                         
-                        expected_color = egg_data["color"]
-                        if not check_text_color(img_bgr, bbox, expected_color):
-                            continue 
-
-                        if keyword == "special":
-                            detected_egg = determine_special_egg_type(img_bgr, bbox)
-                        else:
-                            detected_egg = egg_data["name"]
+                        if "spawn" in clean_word or "egg" in clean_word or clean_text(keyword) in clean_word:
+                            
+                            if check_text_color(img_bgr, bbox, expected_color):
+                                if keyword == "special":
+                                    found_special = determine_special_egg_type(img_bgr, bbox)
+                                    if found_special != "Unknown Special Egg":
+                                        detected_egg = found_special
+                                        color_confirmed = True
+                                        break
+                                else:
+                                    detected_egg = egg_data["name"]
+                                    color_confirmed = True
+                                    break
+                                
+                    if color_confirmed:
                         break
-                if detected_egg: break
-
+                    else:
+                        self.log_message(f"Saw '{egg_data['name']}' text, but color failed.")
+                        
             if detected_egg:
                 current_time = time.time()
                 last_seen_time = self.egg_cooldowns.get(detected_egg, 0)
@@ -872,11 +1057,19 @@ class EggMonitorGUI:
                 self.log_message("Timeout, Running OCR in next cycle.")
             else:
                 self.log_message(f"OCR error: [{error_name}] {e}")
-                
+
+        except Exception as e:
+            error_name = type(e).__name__
+            if error_name == 'TimeoutError':
+                self.log_message("Timeout, Running OCR in next cycle.")
+            else:
+                self.log_message(f"OCR error: [{error_name}] {e}")
+
     def finish_detection(self, egg_name):
         try:
-            self.exit_collection_failsafe()
-            
+            self.global_pause_until = time.time() + 900
+
+
             with mss.mss() as sct:
                 monitor = sct.monitors[1] 
                 full_screenshot = sct.grab(monitor)
@@ -886,14 +1079,14 @@ class EggMonitorGUI:
             
             self.send_discord_webhook(egg_name, full_img_bgr)
 
-            if self.current_run_on_detect and not self.is_playing_path:
+            if self.current_run_on_detect and not self.current_run_continuous and not self.is_playing_path:
                 self.log_message(f"Triggering pathing sequence for {egg_name}...")
                 self.play_path_sequence()
                 
         except Exception as e:
             self.log_message(f"Detection error: {e}")
             
-    def send_discord_webhook(self, egg_name, image_bgr):
+    def send_discord_webhook(self, egg_name, image_bgr, is_periodic=False):
         webhook_url = self.current_webhook_url
         if not webhook_url: 
             return 
@@ -901,19 +1094,28 @@ class EggMonitorGUI:
         user_id = self.current_user_id
         is_success, buffer = cv2.imencode(".png", image_bgr)
         
+        if is_periodic:
+            title = "Periodic Screenshot"
+            desc = f"Routine screenshot of egg points.\n\n[Join Manas Biome Hunt!]({DISCORD_LINK})"
+            embed_color = 3447003 
+        else:
+            title = "Egg Spawned!"
+            desc = f"**{egg_name}** has appeared!\n\n[Join Manas Biome Hunt!]({DISCORD_LINK})"
+            embed_color = 16766720 
+        
         with io.BytesIO(buffer) as io_buf:
             payload = {
                 "embeds": [{
-                    "title": "Egg Spawned!",
+                    "title": title,
                     "url": DISCORD_LINK,
-                    "description": f"**{egg_name}** has appeared!\n\n[Join Manas Biome Hunt!]({DISCORD_LINK})",
-                    "color": 16766720,
+                    "description": desc,
+                    "color": embed_color,
                     "image": {"url": "attachment://chat_capture.png"},
                     "footer": {"text": "Manas's Egg Detector"},
                     "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
                 }]
             }
-            if user_id: payload["content"] = f"<@{user_id}>"
+            if user_id and not is_periodic: payload["content"] = f"<@{user_id}>"
             try: requests.post(webhook_url, data={"payload_json": json.dumps(payload)}, files={"file": ("chat_capture.png", io_buf, "image/png")})
             except Exception as e: self.log_message(f"Webhook error: {e}")
             
